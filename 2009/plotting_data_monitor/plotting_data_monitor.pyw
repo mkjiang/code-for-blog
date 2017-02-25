@@ -3,11 +3,8 @@ A simple demonstration of a serial port monitor that plots live
 data using PyQwt.
 
 The monitor expects to receive single-byte data packets on the 
-serial port. Each received byte is understood as a temperature
+serial port. Each received byte is understood as a biofeedback
 reading and is shown on a live chart.
-
-When the monitor is active, you can turn the 'Update speed' knob
-to control the frequency of screen updates.
 
 Eli Bendersky (eliben@gmail.com)
 License: this code is in the public domain
@@ -18,6 +15,8 @@ from PyQt4.QtCore import *
 from PyQt4.QtGui import *
 import PyQt4.Qwt5 as Qwt
 import Queue
+from scipy import signal, fft
+from numpy import arange
 
 from com_monitor import ComMonitorThread
 from eblib.serialutils import full_port_name, enumerate_serial_ports
@@ -28,13 +27,40 @@ from livedatafeed import LiveDataFeed
 class PlottingDataMonitor(QMainWindow):
     def __init__(self, parent=None):
         super(PlottingDataMonitor, self).__init__(parent)
-        
+
+        self.update_freq = 50
+
+	self.xaxis_min1  = 0
+	self.xaxis_max1  = 60
+	self.xaxis_step1 = 5
+
+	self.xaxis_min2  = 0
+	self.xaxis_max2  = 12
+	self.xaxis_step2 = 1
+
+        #Pulse
+	self.yaxis_min_pulse  = 0
+	self.yaxis_max_pulse  = 2.5
+	self.yaxis_step_pulse = 0.5
+
+        #HR
+	self.yaxis_min_hr  = 0
+	self.yaxis_max_hr  = 200
+	self.yaxis_step_hr = 20
+
+        #FFT
+	self.yaxis_min_fft  = 0
+	self.yaxis_max_fft  = 1
+	self.yaxis_step_fft = 0.1
+	
+	self.xaxis_max_it = 1
+
         self.monitor_active = False
         self.com_monitor = None
         self.com_data_q = None
         self.com_error_q = None
         self.livefeed = LiveDataFeed()
-        self.temperature_samples = []
+        self.biofeedback_samples = []
         self.timer = QTimer()
         
         self.create_menu()
@@ -48,13 +74,13 @@ class PlottingDataMonitor(QMainWindow):
         qle.setFrame(False)
         return (label, qle)
         
-    def create_plot(self):
+    def create_plot_pulse1(self):
         plot = Qwt.QwtPlot(self)
         plot.setCanvasBackground(Qt.black)
         plot.setAxisTitle(Qwt.QwtPlot.xBottom, 'Time')
-        plot.setAxisScale(Qwt.QwtPlot.xBottom, 0, 10, 1)
-        plot.setAxisTitle(Qwt.QwtPlot.yLeft, 'Temperature')
-        plot.setAxisScale(Qwt.QwtPlot.yLeft, 0, 250, 40)
+        plot.setAxisScale(Qwt.QwtPlot.xBottom, self.xaxis_min1, self.xaxis_max1, self.xaxis_step1)
+        plot.setAxisTitle(Qwt.QwtPlot.yLeft, 'Voltage')
+        plot.setAxisScale(Qwt.QwtPlot.yLeft, self.yaxis_min_pulse, self.yaxis_max_pulse, self.yaxis_step_pulse)
         plot.replot()
         
         curve = Qwt.QwtPlotCurve('')
@@ -66,25 +92,98 @@ class PlottingDataMonitor(QMainWindow):
         
         return plot, curve
 
-    def create_thermo(self):
-        thermo = Qwt.QwtThermo(self)
-        thermo.setPipeWidth(6)
-        thermo.setRange(0, 120)
-        thermo.setAlarmLevel(80)
-        thermo.setAlarmEnabled(True)
-        thermo.setFillColor(Qt.green)
-        thermo.setAlarmColor(Qt.red)
-        thermo.setOrientation(Qt.Horizontal, Qwt.QwtThermo.BottomScale)
+    def create_plot_pulse2(self):
+        plot = Qwt.QwtPlot(self)
+        plot.setCanvasBackground(Qt.black)
+        plot.setAxisTitle(Qwt.QwtPlot.xBottom, 'Time')
+        plot.setAxisScale(Qwt.QwtPlot.xBottom, self.xaxis_min2, self.xaxis_max2, self.xaxis_step2)
+        plot.setAxisTitle(Qwt.QwtPlot.yLeft, 'Voltage')
+        plot.setAxisScale(Qwt.QwtPlot.yLeft, self.yaxis_min_pulse, self.yaxis_max_pulse, self.yaxis_step_pulse)
+        plot.replot()
         
-        return thermo
+        curve = Qwt.QwtPlotCurve('')
+        curve.setRenderHint(Qwt.QwtPlotItem.RenderAntialiased)
+        pen = QPen(QColor('limegreen'))
+        pen.setWidth(2)
+        curve.setPen(pen)
+        curve.attach(plot)
+        
+        return plot, curve
 
-    def create_knob(self):
-        knob = Qwt.QwtKnob(self)
-        knob.setRange(0, 20, 0, 1)
-        knob.setScaleMaxMajor(10)
-        knob.setKnobWidth(50)
-        knob.setValue(10)
-        return knob
+    def create_plot_hr1(self):
+        plot = Qwt.QwtPlot(self)
+        plot.setCanvasBackground(Qt.black)
+        plot.setAxisTitle(Qwt.QwtPlot.xBottom, 'Time')
+        plot.setAxisScale(Qwt.QwtPlot.xBottom, self.xaxis_min1, self.xaxis_max1, self.xaxis_step1)
+        plot.setAxisTitle(Qwt.QwtPlot.yLeft, 'BPM')
+        plot.setAxisScale(Qwt.QwtPlot.yLeft, self.yaxis_min_hr, self.yaxis_max_hr, self.yaxis_step_hr)
+        plot.replot()
+        
+        curve = Qwt.QwtPlotCurve('')
+        curve.setRenderHint(Qwt.QwtPlotItem.RenderAntialiased)
+        pen = QPen(QColor('limegreen'))
+        pen.setWidth(2)
+        curve.setPen(pen)
+        curve.attach(plot)
+        
+        return plot, curve
+
+    def create_plot_hr2(self):
+        plot = Qwt.QwtPlot(self)
+        plot.setCanvasBackground(Qt.black)
+        plot.setAxisTitle(Qwt.QwtPlot.xBottom, 'Time')
+        plot.setAxisScale(Qwt.QwtPlot.xBottom, self.xaxis_min2, self.xaxis_max2, self.xaxis_step2)
+        plot.setAxisTitle(Qwt.QwtPlot.yLeft, 'BPM')
+        plot.setAxisScale(Qwt.QwtPlot.yLeft, self.yaxis_min_hr, self.yaxis_max_hr, self.yaxis_step_hr)
+        plot.replot()
+        
+        curve = Qwt.QwtPlotCurve('')
+        curve.setRenderHint(Qwt.QwtPlotItem.RenderAntialiased)
+        pen = QPen(QColor('limegreen'))
+        pen.setWidth(2)
+        curve.setPen(pen)
+        curve.attach(plot)
+        
+        return plot, curve
+
+    def create_plot_fft1(self):
+        plot = Qwt.QwtPlot(self)
+        plot.setCanvasBackground(Qt.black)
+        plot.setAxisTitle(Qwt.QwtPlot.xBottom, 'Time')
+        plot.setAxisScale(Qwt.QwtPlot.xBottom, self.xaxis_min1, self.xaxis_max1, self.xaxis_step1)
+        plot.setAxisTitle(Qwt.QwtPlot.yLeft, 'Frequency')
+        plot.setAxisScale(Qwt.QwtPlot.yLeft, self.yaxis_min_fft, self.yaxis_max_fft, self.yaxis_step_fft)
+        plot.replot()
+        
+        curve = Qwt.QwtPlotCurve('')
+        curve.setRenderHint(Qwt.QwtPlotItem.RenderAntialiased)
+        pen = QPen(QColor('limegreen'))
+        pen.setWidth(2)
+        curve.setPen(pen)
+        curve.attach(plot)
+
+        grid = Qwt.QwtPlotGrid()
+        grid.attach(plot)
+        
+        return plot, curve
+
+    def create_plot_fft2(self):
+        plot = Qwt.QwtPlot(self)
+        plot.setCanvasBackground(Qt.black)
+        plot.setAxisTitle(Qwt.QwtPlot.xBottom, 'Time')
+        plot.setAxisScale(Qwt.QwtPlot.xBottom, self.xaxis_min2, self.xaxis_max2, self.xaxis_step2)
+        plot.setAxisTitle(Qwt.QwtPlot.yLeft, 'Frequency')
+        plot.setAxisScale(Qwt.QwtPlot.yLeft, self.yaxis_min_fft, self.yaxis_max_fft, self.yaxis_step_fft)
+        plot.replot()
+        
+        curve = Qwt.QwtPlotCurve('')
+        curve.setRenderHint(Qwt.QwtPlotItem.RenderAntialiased)
+        pen = QPen(QColor('limegreen'))
+        pen.setWidth(2)
+        curve.setPen(pen)
+        curve.attach(plot)
+        
+        return plot, curve
 
     def create_status_bar(self):
         self.status_text = QLabel('Monitor idle')
@@ -102,32 +201,25 @@ class PlottingDataMonitor(QMainWindow):
         portname_groupbox = QGroupBox('COM Port')
         portname_groupbox.setLayout(portname_layout)
         
-        # Plot and thermo
+        # Plot
         #
-        self.plot, self.curve = self.create_plot()
-        self.thermo = self.create_thermo()
+        self.plot_pulse1, self.curve_pulse1 = self.create_plot_pulse1()
+        self.plot_pulse2, self.curve_pulse2 = self.create_plot_pulse2()
+        self.plot_hr1, self.curve_hr1 = self.create_plot_hr1()
+        self.plot_hr2, self.curve_hr2 = self.create_plot_hr2()
+        self.plot_fft1, self.curve_fft1 = self.create_plot_fft1()
+        self.plot_fft2, self.curve_fft2 = self.create_plot_fft2()
+
+        plot_layout = QGridLayout()
+        plot_layout.addWidget(self.plot_pulse1, 0, 0)
+        plot_layout.addWidget(self.plot_pulse2, 0, 1)
+        plot_layout.addWidget(self.plot_hr1, 1, 0)
+        plot_layout.addWidget(self.plot_hr2, 1, 1)
+        plot_layout.addWidget(self.plot_fft1, 2, 0)
+        plot_layout.addWidget(self.plot_fft2, 2, 1)
+        #self.timer.setInterval(1000.0 / 50)
         
-        thermo_l = QLabel('Average')
-        thermo_layout = QHBoxLayout()
-        thermo_layout.addWidget(thermo_l)
-        thermo_layout.addWidget(self.thermo)
-        thermo_layout.setSpacing(5)
-        
-        self.updatespeed_knob = self.create_knob()
-        self.connect(self.updatespeed_knob, SIGNAL('valueChanged(double)'),
-            self.on_knob_change)
-        self.knob_l = QLabel('Update speed = %s (Hz)' % self.updatespeed_knob.value())
-        self.knob_l.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
-        knob_layout = QVBoxLayout()
-        knob_layout.addWidget(self.updatespeed_knob)
-        knob_layout.addWidget(self.knob_l)
-        
-        plot_layout = QVBoxLayout()
-        plot_layout.addWidget(self.plot)
-        plot_layout.addLayout(thermo_layout)
-        plot_layout.addLayout(knob_layout)
-        
-        plot_groupbox = QGroupBox('Temperature')
+        plot_groupbox = QGroupBox('Plot')
         plot_groupbox.setLayout(plot_layout)
         
         # Main frame and layout
@@ -222,7 +314,7 @@ class PlottingDataMonitor(QMainWindow):
             self.data_q,
             self.error_q,
             full_port_name(str(self.portname.text())),
-            38400)
+            9600)
         self.com_monitor.start()
         
         com_error = get_item_from_queue(self.error_q)
@@ -236,10 +328,9 @@ class PlottingDataMonitor(QMainWindow):
         
         self.timer = QTimer()
         self.connect(self.timer, SIGNAL('timeout()'), self.on_timer)
-        
-        update_freq = self.updatespeed_knob.value()
-        if update_freq > 0:
-            self.timer.start(1000.0 / update_freq)
+
+        if self.update_freq > 0:
+            self.timer.start(1000.0 / self.update_freq)
         
         self.status_text.setText('Monitor running')
     
@@ -250,51 +341,82 @@ class PlottingDataMonitor(QMainWindow):
         self.read_serial_data()
         self.update_monitor()
 
-    def on_knob_change(self):
-        """ When the knob is rotated, it sets the update interval
-            of the timer.
-        """
-        update_freq = self.updatespeed_knob.value()
-        self.knob_l.setText('Update speed = %s (Hz)' % self.updatespeed_knob.value())
-
-        if self.timer.isActive():
-            update_freq = max(0.01, update_freq)
-            self.timer.setInterval(1000.0 / update_freq)
-
     def update_monitor(self):
         """ Updates the state of the monitor window with new 
             data. The livefeed is used to find out whether new
             data was received since the last update. If not, 
             nothing is updated.
         """
+
         if self.livefeed.has_new_data:
             data = self.livefeed.read_data()
+            self.biofeedback_samples.append(
+                (data['timestamp'], data['biofeedback']))
+
+            xdata = [s[0] for s in self.biofeedback_samples]
+            ydata = [s[1] for s in self.biofeedback_samples]
+
+	    if xdata[len(xdata)-1] > self.xaxis_max2*self.xaxis_max_it:
+                #Window draw
+                diff = xdata[len(xdata)-1] - self.xaxis_max2
+                self.plot_pulse2.setAxisScale(Qwt.QwtPlot.xBottom, self.xaxis_min2 + diff, self.xaxis_max2 + diff, 1)
+                self.plot_hr2.setAxisScale(Qwt.QwtPlot.xBottom, self.xaxis_min2 + diff, self.xaxis_max2 + diff, 1)
+                self.plot_fft2.setAxisScale(Qwt.QwtPlot.xBottom, self.xaxis_min2 + diff, self.xaxis_max2 + diff, 1)
+
+	    if xdata[len(xdata)-1] > self.xaxis_max1*self.xaxis_max_it:
+                #Window draw
+                diff = xdata[len(xdata)-1] - self.xaxis_max
+                self.plot_pulse1.setAxisScale(Qwt.QwtPlot.xBottom, self.xaxis_min1 + diff, self.xaxis_max1 + diff, 1)
+                self.plot_hr1.setAxisScale(Qwt.QwtPlot.xBottom, self.xaxis_min1 + diff, self.xaxis_max1 + diff, 1)
+                self.plot_fft1.setAxisScale(Qwt.QwtPlot.xBottom, self.xaxis_min1 + diff, self.xaxis_max1 + diff, 1)
+
+                #Clear and draw
+	        #self.plot.setAxisScale(Qwt.QwtPlot.xBottom, self.xaxis_max*self.xaxis_max_it, self.xaxis_max*(self.xaxis_max_it+1), 1)
+                #Keep all
+                #self.plot.setAxisScale(Qwt.QwtPlot.xBottom, 0, self.xaxis_max*(self.xaxis_max_it+1), 1)
+	        #self.xaxis_max_it += 1
+
+            #Pulse 1 & 2
+            self.curve_pulse1.setData(xdata, ydata)
+            self.plot_pulse1.replot()
+
+            self.curve_pulse2.setData(xdata, ydata)
+            self.plot_pulse2.replot()
+
+            #HR 1 & 2
+            peakind = signal.find_peaks_cwt(ydata, arange(1,50))
+            for i in range(1,len(peakind)):
+                print peakind[i]
+                ydata_hr[i-1] = 60 / (xdata[peakind[i]] - xdata[peakind[i-1]])
+                xdata_hr[i-1] = xdata[peakind[i]]
+
+            self.curve_hr1.setData(xdata_hr,ydata_hr)
+            self.plot_hr1.replot()
+
+            self.curve_hr2.setData(xdata_hr,ydata_hr)
+            self.plot_hr2.replot()
             
-            self.temperature_samples.append(
-                (data['timestamp'], data['temperature']))
-            if len(self.temperature_samples) > 100:
-                self.temperature_samples.pop(0)
+            #FFT 1 & 2
+            ydata_fft = fft(ydata_hr)
+            self.curve_fft1.setData(xdata_hr,ydata_fft)
+            self.plot_fft1.replot()
+
+            self.curve_fft2.setData(xdata_hr,ydata_fft)
+            self.plot_fft2.replot()
             
-            xdata = [s[0] for s in self.temperature_samples]
-            ydata = [s[1] for s in self.temperature_samples]
-            
-            avg = sum(ydata) / float(len(ydata))
-                
-            self.plot.setAxisScale(Qwt.QwtPlot.xBottom, xdata[0], max(20, xdata[-1]))
-            self.curve.setData(xdata, ydata)
-            self.plot.replot()
-            
-            self.thermo.setValue(avg)
             
     def read_serial_data(self):
         """ Called periodically by the update timer to read data
             from the serial port.
-        """
-        qdata = list(get_all_from_queue(self.data_q))
+	"""
+	qdata = list(get_all_from_queue(self.data_q))
+	
         if len(qdata) > 0:
-            data = dict(timestamp=qdata[-1][1], 
-                        temperature=ord(qdata[-1][0]))
-            self.livefeed.add_data(data)
+            print ("len: " + str(len(qdata)))
+            for ind in range(0,len(qdata)):
+                data = dict(timestamp=qdata[ind][1], biofeedback=qdata[ind][0])
+                print ("xd " + str(qdata[ind][1]) + " yd " + str(qdata[ind][0]))
+                self.livefeed.add_data(data)
     
     # The following two methods are utilities for simpler creation
     # and assignment of actions
